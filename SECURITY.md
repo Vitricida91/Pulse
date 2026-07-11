@@ -39,12 +39,49 @@ Ver el razonamiento completo en `ARCHITECTURE.md` y en `DECISIONS.md`.
 
 ## Control de acceso por rol (aplicación)
 
-- **Admin** y **scanner** son cuentas individuales de Supabase Auth
-  (`profiles.role`). El personal de acceso nunca comparte una
-  contraseña entre dispositivos.
-- Las rutas `/admin/*` y `/scan` requieren sesión válida y el rol
-  correspondiente, verificado del lado del servidor (no solo ocultando
-  UI en el cliente). Se implementa en la Fase 2.
+- **Admin** y **scanner** son cuentas individuales de Supabase Auth. La
+  fuente de verdad del rol es `organization_memberships`
+  (`organization_id` + `profile_id` + `role` + `status`), **no** un
+  campo global en `profiles` — ese campo (`profiles.role`) existió en la
+  Fase 1 y se eliminó en la Revisión Arquitectónica 1.1 precisamente
+  para no tener dos fuentes de verdad de autorización en paralelo. El
+  personal de acceso nunca comparte una contraseña entre dispositivos.
+- **`role = 'admin'` en una membresía significa "administrador de esa
+  organización", nunca "administrador global de la plataforma".** Hoy
+  solo existe una organización, así que en la práctica no hay
+  diferencia visible — pero el modelo ya lo distingue para no
+  encontrarse, en un futuro con más de una organización, con un `admin`
+  que accede sin querer a datos de otra. Si en el futuro existe
+  administración global de la plataforma (Horizonte 2+), debe
+  modelarse como una entidad separada (ej. un flag o tabla de "platform
+  administrators" independiente) — nunca reutilizando una membresía de
+  organización como mecanismo de acceso global. No implementado todavía
+  porque el MVP no lo necesita.
+- Las rutas `/admin/*` y `/scan` requieren, en la Fase 2 (no
+  implementada todavía): (1) usuario autenticado, (2) resolver la
+  organización correspondiente, (3) una membresía **activa** en esa
+  organización (`status = 'active'` — una membresía inactiva no
+  concede ningún permiso), (4) rol suficiente para la operación. Las
+  cuatro comprobaciones son server-side, nunca solo ocultando UI en el
+  cliente.
+
+## Aislamiento de datos entre organizaciones (futuro)
+
+Con una sola organización operativa, no hay hoy ningún dato que aislar
+en la práctica — este apartado documenta la estrategia para cuando
+exista una segunda organización (Horizonte 2), no algo ya activo.
+
+La pertenencia organizacional no está duplicada en cada tabla: se
+deriva por relaciones (ver ARCHITECTURE.md → "Organizaciones — SaaS-ready,
+no SaaS-yet"), con un máximo de 2 saltos (`payments`/`payment_attempts`/`order_items`
+→ `orders.event_id` → `events.organization_id`). Cuando corresponda
+implementar RLS activo por organización, las policies se escriben como
+un `EXISTS` contra `organization_memberships` filtrando por la
+organización derivada de cada fila — ningún cambio de esquema adicional
+hace falta para eso, ya quedó preparado en esta revisión. Hasta
+entonces, sigue rigiendo el deny-by-default: **no se crean policies
+permisivas ahora "porque ya existe la tabla de membresías"** — el
+acceso de negocio sigue siendo exclusivamente server-side.
 
 ## Tokens
 
@@ -138,5 +175,5 @@ herramienta y justificación en `DECISIONS.md`.
   job de expiración con conteo).
 - `access_logs`: cada intento de validación de QR en la puerta,
   exitoso o no, con el resultado y quién/qué dispositivo lo hizo.
-- `webhook_events`: cada notificación entrante de Mercado Pago, válida
-  o no, procesada o no.
+- `webhook_events`: cada notificación entrante de cualquier proveedor de
+  pagos, válida o no, procesada o no.

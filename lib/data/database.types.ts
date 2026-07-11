@@ -21,7 +21,6 @@ export type Database = {
           id: string;
           name: string;
           email: string;
-          role: Database["public"]["Enums"]["profile_role"];
           active: boolean;
           created_at: string;
         };
@@ -29,15 +28,55 @@ export type Database = {
           id: string;
           name: string;
           email: string;
-          role: Database["public"]["Enums"]["profile_role"];
           active?: boolean;
           created_at?: string;
         };
         Update: Partial<Database["public"]["Tables"]["profiles"]["Insert"]>;
       };
+      organizations: {
+        Row: {
+          id: string;
+          name: string;
+          slug: string;
+          status: Database["public"]["Enums"]["organization_status"];
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: {
+          id?: string;
+          name: string;
+          slug: string;
+          status?: Database["public"]["Enums"]["organization_status"];
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: Partial<Database["public"]["Tables"]["organizations"]["Insert"]>;
+      };
+      organization_memberships: {
+        Row: {
+          id: string;
+          organization_id: string;
+          profile_id: string;
+          role: Database["public"]["Enums"]["organization_role"];
+          status: Database["public"]["Enums"]["membership_status"];
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: {
+          id?: string;
+          organization_id: string;
+          profile_id: string;
+          role: Database["public"]["Enums"]["organization_role"];
+          status?: Database["public"]["Enums"]["membership_status"];
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: Partial<Database["public"]["Tables"]["organization_memberships"]["Insert"]>;
+      };
       events: {
         Row: {
           id: string;
+          organization_id: string;
           title: string;
           slug: string;
           description: string | null;
@@ -53,6 +92,7 @@ export type Database = {
         };
         Insert: {
           id?: string;
+          organization_id: string;
           title: string;
           slug: string;
           description?: string | null;
@@ -106,6 +146,7 @@ export type Database = {
       orders: {
         Row: {
           id: string;
+          event_id: string;
           buyer_name: string;
           buyer_email: string;
           buyer_phone: string | null;
@@ -122,6 +163,7 @@ export type Database = {
         };
         Insert: {
           id?: string;
+          event_id: string;
           buyer_name: string;
           buyer_email: string;
           buyer_phone?: string | null;
@@ -390,7 +432,9 @@ export type Database = {
       };
     };
     Enums: {
-      profile_role: "admin" | "scanner";
+      organization_status: "active" | "inactive";
+      organization_role: "admin" | "scanner";
+      membership_status: "active" | "inactive";
       event_status: "draft" | "published" | "unpublished" | "cancelled";
       ticket_type_status: "active" | "inactive";
       reservation_status: "ACTIVE" | "RELEASED" | "EXPIRED" | "CONVERTED";
@@ -435,6 +479,7 @@ export type Database = {
           p_buyer_name: string;
           p_buyer_email: string;
           p_buyer_phone: string | null;
+          p_event_id: string;
           p_idempotency_key: string;
           p_items: Json;
           p_reservation_minutes?: number;

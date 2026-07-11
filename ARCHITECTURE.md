@@ -31,8 +31,9 @@ Ver las migraciones en `supabase/migrations/20260711182551_schema_core.sql`
 para el detalle completo de columnas, constraints e índices. Resumen de
 tablas:
 
-`profiles`, `events`, `ticket_types`, `orders`, `stock_reservations`,
-`order_items`, `payment_attempts`, `payments`, `tickets`, `access_logs`,
+`organizations`, `organization_memberships`, `profiles`, `events`,
+`ticket_types`, `orders`, `stock_reservations`, `order_items`,
+`payment_attempts`, `payments`, `tickets`, `access_logs`,
 `webhook_events`, `recovery_tokens`, `email_logs`, `admin_audit_logs`.
 
 `orders` no tiene **ningún** campo específico de un proveedor de pagos
@@ -45,7 +46,40 @@ referenciando siempre `order_id`.
 Decisiones de modelado no triviales están documentadas en `DECISIONS.md`
 (reservas de stock, máquina de estados de `orders`, separación
 `payment_attempts`/`payments`, dinero en centavos, tokens, política de
-doble pago).
+doble pago, organizaciones y membresías).
+
+### Organizaciones — SaaS-ready, no SaaS-yet
+
+El sistema nació para un solo organizador (The Pulse Project) pero el
+modelo de datos ya distingue explícitamente **plataforma**,
+**organización** y **evento**, sin implementar ninguna funcionalidad
+comercial de plataforma multi-organizador (billing, planes, marketplace,
+onboarding de organizaciones — ver ROADMAP.md → "Future Product
+Evolution").
+
+- `organizations`: entidad raíz mínima (`name`, `slug`, `status`). Una
+  sola fila hoy ("The Pulse Project"), sembrada de forma idempotente por
+  migración — nunca hardcodeada en el dominio (ver DECISIONS.md).
+- `events.organization_id`: cada evento pertenece obligatoriamente a una
+  organización.
+- `orders.event_id`: cada orden pertenece a un único evento (y por lo
+  tanto, transitivamente, a una única organización). `create_order_with_reservation`
+  exige y verifica esto server-side — ver más abajo.
+- **La organización no se duplica en cada tabla.** Se deriva vía
+  relaciones existentes, nunca a más de 2 saltos: `ticket_types`,
+  `tickets` y `access_logs` ya tenían `event_id` directo (0 cambios);
+  `order_items`, `payment_attempts` y `payments` la derivan vía
+  `order_id → orders.event_id → events.organization_id`. Es la
+  estrategia elegida para no "agregar `organization_id` indiscriminadamente"
+  ni depender de joins inmanejables — ver el análisis completo en
+  DECISIONS.md.
+- `organization_memberships` (`organization_id`, `profile_id`, `role`,
+  `status`) reemplaza el rol global `profiles.role` de la Fase 1 —
+  eliminado en esta revisión. Roles acotados a `admin`/`scanner` por
+  ahora; `OWNER`/`MANAGER`/`VIEWER` quedan solo documentados como
+  extensión futura de este mismo enum.
+- **`admin` significa "administrador de esa organización", nunca
+  "administrador global de la plataforma".** Ver SECURITY.md.
 
 ### Arquitectura de pagos agnóstica al proveedor
 
@@ -110,7 +144,7 @@ Funciones RPC expuestas (`GRANT EXECUTE` solo a `service_role`):
 
 | Función | Uso |
 |---|---|
-| `create_order_with_reservation` | Crea la orden + reserva stock de forma atómica. Precios siempre leídos server-side. Idempotente (ver DECISIONS.md). |
+| `create_order_with_reservation` | Crea la orden + reserva stock de forma atómica, acotada a un único `event_id` (rechaza mezclar `ticket_types` de eventos distintos o un `event_id` inconsistente). Precios siempre leídos server-side. Idempotente (ver DECISIONS.md). |
 | `expire_stale_reservations` | Libera reservas `ACTIVE` vencidas y expira las órdenes correspondientes. Pensada para correr cada 1 min vía `pg_cron`. |
 | `release_reservation_for_order` | Libera de inmediato la reserva de una orden (pago rechazado/cancelado, o cancelación manual). |
 | `record_payment_and_confirm_order` | Punto de entrada único y agnóstico al proveedor al recibir un hecho de pago ya normalizado y verificado. Registra el pago (idempotente), implementa la política de "pago tardío", detecta doble pago y sincroniza reembolsos/chargebacks (ver DECISIONS.md). |
@@ -171,8 +205,11 @@ pruebas funcionales (creación de orden, idempotencia, sold-out,
 expiración, pago tardío sin stock, doble escaneo concurrente, pago
 rechazado con liberación inmediata, doble pago real de dos proveedores
 distintos para la misma orden, sincronización de reembolso con cascada
-a las entradas). El resultado de esas pruebas está en los informes de
-cierre de la Fase 1 y de su corrección posterior.
+a las entradas, integridad de orden acotada a un único evento —caso
+válido y los dos casos inválidos descritos en DECISIONS.md—, e
+idempotencia del seed de `organizations`). El resultado de esas pruebas
+está en los informes de cierre de la Fase 1 y de sus dos correcciones
+posteriores (pagos agnósticos y Revisión Arquitectónica 1.1).
 
 `lib/data/database.types.ts` se escribió a mano a partir de las
 migraciones por el mismo motivo (no se pudo generar con el CLI). Debe

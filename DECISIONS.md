@@ -431,3 +431,147 @@ que extienda un enum — la validación del conjunto de proveedores
 soportados vive en el código (el tipo `ProviderId` de
 `lib/payments/types.ts`), no en una constraint de Postgres que hay que
 migrar cada vez.
+
+## Revisión Arquitectónica 1.1 — SaaS-ready, no SaaS-yet
+
+**Contexto:** el proyecto sigue teniendo un único organizador real (The
+Pulse Project) y ninguna funcionalidad comercial de plataforma
+(billing, planes, marketplace) está en alcance. Pero el modelo de la
+Fase 1 no distinguía "organización" de "evento" en absoluto — todo
+evento pertenecía implícitamente a una plataforma sin nombre. Esta
+revisión introduce esa distinción con el cambio mínimo necesario para
+no acumular deuda técnica antes de escribir la Fase 2 (autenticación y
+panel admin), sin construir ninguna funcionalidad multi-organizador
+real todavía.
+
+A diferencia de la corrección de pagos anterior (donde se editaron las
+migraciones de la Fase 1 porque nada estaba desplegado en ningún
+entorno real), esta vez se usaron **migraciones nuevas e incrementales**
+(`20260711190034_add_organizations_and_memberships.sql`,
+`20260711190036_rls_organizations_and_memberships.sql`,
+`20260711190037_scope_orders_to_single_event.sql`), seguiendo la
+instrucción explícita de preservar el trabajo ya publicado y el
+historial de migraciones tal como está.
+
+### Gap de integridad encontrado: `orders` sin `event_id`
+
+`create_order_with_reservation` nunca exigió que los `ticket_type_id`
+de una orden pertenecieran al mismo evento — un problema independiente
+de organizaciones, que esta revisión hizo visible y corrigió. Ahora
+`orders.event_id` es obligatorio, y el RPC valida, dentro de la misma
+transacción que ya bloquea cada `ticket_type`, que **todos** pertenezcan
+al `event_id` declarado. Un único chequeo (`v_tt.event_id <>
+p_event_id`) cubre tanto mezclar dos eventos en una orden como declarar
+un `event_id` que no coincide con el `ticket_type_id` recibido — son la
+misma violación vista desde dos ángulos.
+
+**Verificado contra Postgres real**, los tres casos pedidos:
+- General(Evento A) + VIP(Evento A), mismo `p_event_id` → permitido, orden creada.
+- General(Evento A) + General(Evento B), `p_event_id` = Evento A → rechazado (`TICKET_TYPE_EVENT_MISMATCH`), sin fila huérfana (transacción completa revertida).
+- `p_event_id` = Evento A con un `ticket_type_id` que en realidad pertenece a Evento B → mismo rechazo.
+- (Adicional) `p_event_id` inexistente → rechazado (`EVENT_NOT_FOUND`) antes de tocar ninguna fila.
+
+### `organizations`: modelo mínimo
+
+Campos: `id`, `name`, `slug`, `status`, `created_at`, `updated_at` — se
+descartó agregar ya `legal_name`, `contact_email` o `logo_url` (listados
+como posibles por el encargo) porque ninguno tiene un uso funcional hoy;
+se agregan como columnas nuevas nullable el día que el branding o el
+onboarding de organizaciones (Horizonte 2) los necesite, sin migración
+disruptiva.
+
+### Propagación de `organization_id`: derivada, no duplicada
+
+**Decisión:** `organization_id` es una columna real solo en `events`
+(FK obligatoria). En todo lo demás se deriva por relaciones ya
+existentes:
+
+| Tabla | Organización |
+|---|---|
+| `ticket_types`, `tickets`, `access_logs` | ya tenían `event_id` directo → 1 salto, sin cambios |
+| `orders` | nuevo `event_id` → 1 salto |
+| `order_items`, `payment_attempts`, `payments` | vía `order_id → orders.event_id → events` → 2 saltos |
+
+**Motivo:** agregar `organization_id` a las 14 tablas hubiese creado 14
+fuentes de verdad potencialmente inconsistentes entre sí (¿qué pasa si
+el `organization_id` "cacheado" en `tickets` no coincide con el de su
+`events`, por un bug o una migración a medias?). Derivar por relación
+tiene una sola fuente de verdad (`events.organization_id`) y un costo de
+consulta bajo (2 saltos como máximo, indexados), que solo importa el
+día que se escriban policies RLS reales — hoy no hay ninguna, sigue
+rigiendo deny-by-default.
+
+### `organization_memberships`: opción C (adoptar el modelo final, acotado al MVP)
+
+**Decisión:** crear `organization_memberships` ya, con `role` limitado
+a `admin`/`scanner` (sin `OWNER`/`MANAGER`/`VIEWER` todavía) y `status`
+limitado a `active`/`inactive` (sin estados de invitación/onboarding),
+y **eliminar `profiles.role`** en la misma migración.
+
+**Por qué no la alternativa A (mantener `profiles.role` un tiempo más):**
+la Fase 2 (autenticación + panel admin) es el próximo trabajo. Si se
+construye sobre un rol global y después hay que migrar a roles por
+organización, se reescribe toda la autorización ya escrita. Haciendo el
+cambio ahora, antes de que exista ese código, el costo es solo de
+modelo de datos.
+
+**Por qué no mantener ambos en paralelo (un verdadero "híbrido"):** dos
+fuentes de verdad sobre "qué rol tiene este usuario" es en sí mismo un
+riesgo de seguridad (¿cuál gana si alguna vez difieren?) en un sistema
+que controla acceso a dinero y a la puerta de un evento. Se eliminó
+`profiles.role` en el mismo movimiento, sin backfill de datos porque no
+existe ningún perfil real todavía (Fase 2/Auth no está implementada).
+
+### Administrador de organización vs. administrador de plataforma
+
+**Decisión:** `organization_memberships.role = 'admin'` significa
+exclusivamente "administrador de esa organización". No se implementa
+ningún `super_admin` ni administración global de plataforma en esta
+revisión — no hace falta para un solo organizador. Se documenta como
+regla para el futuro: si llega a existir, debe modelarse aparte (no
+como un valor especial de `organization_memberships.role`, que seguiría
+significando siempre "rol dentro de una organización concreta").
+
+### Estrategia de seed de la primera organización
+
+**Decisión:** un `INSERT ... ON CONFLICT (slug) DO NOTHING` embebido en
+la migración de esquema, no un archivo `supabase/seed.sql` separado.
+
+**Motivo:** `supabase/seed.sql` es un mecanismo pensado para datos de
+desarrollo/demo — el CLI lo corre automáticamente después de las
+migraciones en `supabase db reset` (destructivo, local), pero **no** en
+`db push` contra un proyecto remoto salvo que se pase explícitamente
+`--include-seed`. La primera organización real necesita existir en
+**todos** los entornos, incluida producción, de forma tan confiable como
+cualquier otra pieza del esquema — por eso va en una migración
+versionada normal, no en el mecanismo de seed de desarrollo. `ON
+CONFLICT (slug) DO NOTHING` la hace idempotente: aplicar la migración
+más de una vez (ej. durante un `db reset` local) no duplica la fila. El
+UUID lo genera Postgres (`gen_random_uuid()`); no hay ningún literal de
+UUID escrito a mano en ningún archivo. **Verificado**: tras aplicar
+todas las migraciones y reintentar manualmente el `INSERT` de la
+organización sembrada, el resultado fue `INSERT 0 0` (cero filas
+afectadas) y `select count(*) from organizations` siguió devolviendo 1.
+
+### Confirmación del modelado de doble pago (sin cambios)
+
+Se inspeccionó `record_payment_and_confirm_order` antes de tocar nada,
+como se pidió. Resultado: el estado financiero (`payments.status`,
+ej. `APPROVED`) y el estado de reconciliación (`payments.reconciliation_status`,
+ej. `DUPLICATE_REQUIRES_REFUND`) **ya eran columnas independientes**
+desde la corrección de pagos anterior — la rama que detecta un pago
+duplicado nunca sobrescribe `status`, solo agrega la marca de
+reconciliación en una columna aparte. Es exactamente la opción B que
+se pidió confirmar ("un estado de reconciliación independiente"), no la
+A (mezclados). No se modificó el modelo.
+
+**Prueba explícita agregada** (dos proveedores distintos, `mercadopago`
+y `bank_transfer`, aprobando la misma orden): el primer pago resuelve la
+orden normalmente (`PAID`, 2 entradas emitidas). El segundo pago,
+genuinamente distinto, queda registrado con `status = 'APPROVED'` (el
+proveedor de verdad lo aprobó — ese hecho no se pierde) y
+`reconciliation_status = 'DUPLICATE_REQUIRES_REFUND'`; no se emitió
+ninguna entrada adicional, `ticket_types.sold`/`reserved` no cambiaron,
+la orden se mantuvo en `PAID` (no se "re-completó"), y quedó una entrada
+en `admin_audit_logs` (`duplicate_payment_detected`) para que un admin
+la detecte y gestione el reembolso manualmente.
