@@ -3,9 +3,10 @@ import { PlaceholderPage } from "@/components/placeholder-page";
 export default function HomePage() {
   return (
     <PlaceholderPage
-      eyebrow="The Pulse Project"
-      title="Entradas online — en construcción"
-      description="La plataforma de venta de entradas se está desarrollando por fases. El listado de shows disponibles se publicará acá."
+      eyebrow="Pulse Tickets (nombre técnico provisorio)"
+      title="Plataforma de ticketing en desarrollo"
+      description="El sistema todavía no está abierto a la venta de entradas. Esta pantalla es temporal, únicamente para verificar el estado del deployment."
+      status="Estado: MVP en construcción"
     />
   );
 }
