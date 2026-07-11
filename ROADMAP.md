@@ -38,6 +38,25 @@ fuente de verdad de autorización reemplazando el rol global
 `profiles.role`. Sin ninguna funcionalidad multi-organizador real
 todavía — ver "Future Product Evolution" más abajo. Ver DECISIONS.md.
 
+## Fase 1.5 — Primer preview deployment ✅
+
+Proyecto conectado a Vercel y desplegado desde la rama
+`claude/event-ticketing-platform-3h0ki3`, sin ninguna variable de
+entorno configurada (no hacía falta ninguna para este alcance). Página
+temporal de verificación en `/`. Confirmado accesible y correcto por el
+usuario en su navegador: https://22954534.vercel.app/
+
+Nota para antes de la Fase 3/7: no pude verificar la URL de forma
+independiente desde este entorno (tanto el proxy de red de este entorno
+como la herramienta de fetch propia recibieron `403 Forbidden` al
+intentar acceder de forma anónima). Es compatible con que Vercel tenga
+activada la protección de deployment (SSO/contraseña) por defecto en
+previews, lo cual bloquearía a cualquiera sin sesión en la cuenta de
+Vercel del proyecto — hay que confirmarlo y, si corresponde,
+desactivarlo específicamente para el entorno de Producción antes de la
+Fase 7, ya que los webhooks de Mercado Pago necesitan poder alcanzar la
+URL sin autenticación de Vercel de por medio.
+
 ## Fase 2 — Eventos y administración (próxima)
 
 - Autenticación (Supabase Auth) y control de acceso por rol server-side.
