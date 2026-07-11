@@ -286,3 +286,148 @@ disponible) o crear un proyecto Supabase real y correr
 `npx supabase db push` / vincular el proyecto, para validar en el stack
 real de Supabase (incluyendo `pg_cron`, que tampoco está disponible en
 un Postgres genérico sin el módulo precompilado).
+
+## Corrección post-Fase 1: arquitectura de pagos agnóstica al proveedor
+
+**Contexto:** el modelo de la Fase 1 acopló `orders` directamente a
+Mercado Pago (`orders.mercado_pago_preference_id`) y usó un
+`payment_status` que era literalmente el vocabulario de estados de la
+API de pagos de Mercado Pago. Esto es incorrecto: Mercado Pago es el
+primer proveedor integrado, no el único que la plataforma va a soportar
+nunca. Se corrige antes de construir Fase 2/3 sobre esa base, editando
+directamente las migraciones de la Fase 1 (no apilando una migración
+correctiva) porque, a la fecha de esta corrección, ningún entorno real
+las tiene aplicadas todavía — ver la nota de verificación sin Docker más
+arriba. Si en el futuro hiciera falta corregir algo ya aplicado a un
+proyecto real, el camino correcto sería una migración nueva, no editar
+una ya aplicada.
+
+### `PaymentProvider`: contrato agnóstico, no una interfaz rígida
+
+**Decisión:** `lib/payments/types.ts` define el contrato que cualquier
+adapter de proveedor debe cumplir (`createPaymentSession`,
+`getPaymentStatus`, `verifyWebhookSignature`, `parseWebhookEvent`) más
+un objeto `capabilities` (`instantConfirmation`, `refundNotifications`,
+`programmaticRefunds`) y un método opcional (`initiateRefund`, solo
+si `programmaticRefunds` es `true`). La lógica de negocio nunca importa
+un SDK de proveedor concreto; solo estos tipos.
+
+**Motivo de no unificar todo en una interfaz rígida:** proveedores
+reales difieren de forma genuina, no solo en detalles de implementación.
+Una transferencia bancaria no tiene "sesión" en el sentido de Mercado
+Pago, no confirma instantáneamente y no tiene webhook real. Forzar a
+todos los adapters a implementar exactamente lo mismo hubiese llevado a
+métodos vacíos o a mentir sobre capacidades que un proveedor no tiene.
+Las diferencias conocidas/previstas entre `MercadoPagoProvider` (Fase 3)
+y un futuro `BankTransferProvider` (no implementado) están documentadas
+en los comentarios de `lib/payments/types.ts`.
+
+### Modelo de datos: `payment_attempts` + `payments`, no acoplado a ningún proveedor
+
+**Decisión:** dos tablas con responsabilidades distintas:
+
+- **`payment_attempts`**: la sesión/intento iniciado con un proveedor
+  (equivalente genérico a una "preferencia" de Mercado Pago), creada
+  *antes* de que exista cualquier pago confirmado. `provider` es
+  `text`, no un enum, para que agregar un proveedor nuevo no requiera
+  una migración que extienda un tipo de Postgres. `external_session_id`
+  es nullable porque no todos los proveedores tienen concepto de
+  sesión (ej. una transferencia bancaria).
+- **`payments`**: el hecho de pago normalizado ya reportado por un
+  proveedor (aprobado, rechazado, reembolsado, etc.), con
+  `payment_attempt_id` nullable (un pago puede llegar sin que hayamos
+  registrado antes su sesión) y `external_reference` (el identificador
+  que le pasamos al proveedor para que nos lo devuelva intacto —
+  en general el propio `order_id` — mecanismo agnóstico preferido para
+  resolver a qué orden pertenece un pago).
+
+**Alternativas consideradas:**
+- **A. `payment_sessions` separada de `payments`, sin más:** válida,
+  pero no distinguía claramente el caso de un pago que llega sin sesión
+  previa conocida (por eso `payment_attempt_id` es nullable en vez de
+  obligatorio).
+- **B. Incorporar la sesión dentro de `payments`:** mezcla dos
+  conceptos con ciclos de vida distintos (una sesión puede no derivar
+  nunca en un pago; un pago siempre referencia, cuando existe, la
+  sesión de la que vino) en una sola fila, complicando el modelo de
+  estados de ambos.
+- **C. `payment_attempts` + `payments` (elegida):** separa "intención de
+  pago" de "hecho de pago", cada una con su propia máquina de estados
+  (`payment_attempt_status` vs `payment_status`), y permite que un pago
+  se resuelva sin depender de haber trackeado su sesión.
+
+`orders` no gana ningún campo nuevo por esto — sigue sin conocer nada
+de pagos, tal como estaba pensado desde la Fase 0.1, solo que ahora esa
+separación es real y no rota por `mercado_pago_preference_id`.
+
+### Estados normalizados de pago
+
+**Decisión:** `payment_status` pasa a ser un enum genérico —
+`PENDING`, `IN_PROGRESS`, `APPROVED`, `REJECTED`, `CANCELLED`,
+`REFUNDED`, `CHARGED_BACK` — en vez del vocabulario literal de Mercado
+Pago. Cada adapter normaliza su propio estado a uno de estos. Mapeo
+documentado para `MercadoPagoProvider` (a implementar en la Fase 3):
+
+| Estado de Mercado Pago | Estado interno |
+|---|---|
+| `pending` | `PENDING` |
+| `in_process` | `IN_PROGRESS` |
+| `authorized` | `IN_PROGRESS` |
+| `in_mediation` | `IN_PROGRESS` (el detalle se conserva en `raw_provider_status`) |
+| `approved` | `APPROVED` |
+| `rejected` | `REJECTED` |
+| `cancelled` | `CANCELLED` |
+| `refunded` | `REFUNDED` |
+| `charged_back` | `CHARGED_BACK` |
+
+### Política de doble pago
+
+**Decisión:** `record_payment_and_confirm_order` es el único punto de
+entrada para registrar un hecho de pago y decidir qué hacer con la
+orden. Si llega un pago `APPROVED` para una orden que **ya** está
+`PAID`/`PAID_REQUIRES_REVIEW`, la función distingue dos casos:
+
+1. **Reintento del mismo pago** (mismo `(provider, external_payment_id)`,
+   ej. reintento de webhook): `INSERT ... ON CONFLICT`-equivalente
+   idempotente, no pasa nada más. No es un doble pago.
+2. **Un pago genuinamente distinto** (otro `external_payment_id`, del
+   mismo proveedor o de uno diferente): se marca ese pago
+   `reconciliation_status = 'DUPLICATE_REQUIRES_REFUND'`, se registra en
+   `admin_audit_logs` (acción `duplicate_payment_detected`, con el
+   pago anterior referenciado), y **no** se emiten entradas de más ni se
+   cambia el estado de la orden (la orden ya estaba correctamente
+   cumplida por el primer pago). La resolución (reembolsar el pago
+   duplicado) queda para un admin, vía el proveedor correspondiente —
+   consistente con la decisión de la Fase 0.1 de no automatizar
+   reembolsos en el MVP.
+
+**Por qué a nivel de `payments` y no de `orders`:** una orden con un
+pago duplicado sigue absolutamente bien desde el punto de vista de
+cumplimiento (el comprador tiene sus entradas); lo que está mal es
+puramente financiero (se le cobró de más). Mezclar esto con el estado
+de `orders` (pensado para el ciclo de vida de cumplimiento:
+pendiente/pagada/requiere revisión/cancelada/reembolsada) hubiese
+confundido dos preguntas distintas ("¿la orden está resuelta?" vs
+"¿hay un excedente de dinero que reconciliar?").
+
+**Verificado:** contra Postgres real — un pago aprobado de Mercado Pago
+seguido de un segundo pago aprobado de un proveedor distinto
+(`bank_transfer`) para la misma orden. Resultado: 1 sola entrada
+emitida, segundo pago marcado `DUPLICATE_REQUIRES_REFUND`, entrada en
+`admin_audit_logs`. También se verificó el reintento idempotente del
+mismo pago (no duplica entradas) y la sincronización de un reembolso
+reportado por el proveedor sobre una orden ya `PAID` (cascada a
+`REFUNDED` en la orden y en las entradas todavía `VALID`, sin tocar
+entradas ya `USED`).
+
+### `provider` como `text`, no enum
+
+**Decisión:** tanto `payment_attempts.provider` como `payments.provider`
+son `text` con `check (provider <> '')`, no un tipo enum de Postgres.
+
+**Motivo:** agregar un proveedor nuevo (un adapter nuevo en
+`lib/payments/`) no debería requerir una migración de base de datos
+que extienda un enum — la validación del conjunto de proveedores
+soportados vive en el código (el tipo `ProviderId` de
+`lib/payments/types.ts`), no en una constraint de Postgres que hay que
+migrar cada vez.

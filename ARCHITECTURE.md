@@ -11,7 +11,7 @@ por capas dentro del mismo proyecto, no por proceso.
 app/            UI + Route Handlers (público, /admin, /scan, /api)
 lib/domain/     Lógica de negocio pura, sin I/O, testeable sin infraestructura
 lib/data/       Acceso a datos (Supabase, server-only, service role)
-lib/payments/   Integración con Mercado Pago
+lib/payments/   Contrato PaymentProvider agnóstico + adapters por proveedor
 lib/tickets/    Generación de QR y tokens
 lib/email/      Envío de emails detrás de una interfaz EmailProvider
 lib/auth/       Sesión y control de roles
@@ -32,12 +32,46 @@ para el detalle completo de columnas, constraints e índices. Resumen de
 tablas:
 
 `profiles`, `events`, `ticket_types`, `orders`, `stock_reservations`,
-`order_items`, `payments`, `tickets`, `access_logs`, `webhook_events`,
-`recovery_tokens`, `email_logs`, `admin_audit_logs`.
+`order_items`, `payment_attempts`, `payments`, `tickets`, `access_logs`,
+`webhook_events`, `recovery_tokens`, `email_logs`, `admin_audit_logs`.
+
+`orders` no tiene **ningún** campo específico de un proveedor de pagos
+(ver "Arquitectura de pagos agnóstica al proveedor" más abajo y
+DECISIONS.md). Esa relación vive en `payment_attempts` (la
+sesión/intento iniciado con un proveedor) y `payments` (el hecho de
+pago normalizado, ya confirmado o rechazado por el proveedor),
+referenciando siempre `order_id`.
 
 Decisiones de modelado no triviales están documentadas en `DECISIONS.md`
 (reservas de stock, máquina de estados de `orders`, separación
-`orders`/`payments`, dinero en centavos, tokens).
+`payment_attempts`/`payments`, dinero en centavos, tokens, política de
+doble pago).
+
+### Arquitectura de pagos agnóstica al proveedor
+
+La lógica de dominio (órdenes, stock, reservas, entradas, QR, accesos)
+no conoce Mercado Pago ni ningún otro proveedor de pagos concreto. El
+único punto de contacto es el contrato `PaymentProvider` en
+`lib/payments/types.ts`:
+
+- `createPaymentSession` — inicia una sesión/preferencia/intento de pago.
+- `getPaymentStatus` — re-consulta el estado real contra la API del proveedor (nunca se confía solo en un webhook).
+- `verifyWebhookSignature` / `parseWebhookEvent` — validación y parseo específicos de cada proveedor.
+- `initiateRefund` (opcional) — solo si `capabilities.programmaticRefunds` es `true`; ningún adapter del MVP lo implementa (los reembolsos son manuales, decisión de la Fase 0.1).
+
+`MercadoPagoProvider` (Fase 3) será el primer adapter concreto — el
+único lugar del código que importa el SDK de Mercado Pago. Un futuro
+`BankTransferProvider` (no implementado, arquitectura preparada)
+tendría `capabilities.instantConfirmation = false`: una orden pagada
+por transferencia queda pendiente de verificación manual, no se asume
+que todo pago es instantáneo. Ver el detalle de capacidades
+obligatorias/opcionales y las diferencias documentadas entre
+proveedores en los comentarios de `lib/payments/types.ts`.
+
+Rutas de webhook por proveedor (Fase 3): `/api/webhooks/[provider]`.
+Cada proveedor valida su propia firma/autenticación y parsea su propio
+formato; la lógica posterior (normalización → `record_payment_and_confirm_order`)
+es común a todos.
 
 ### Acceso a datos: RLS deny-by-default + service role
 
@@ -79,7 +113,7 @@ Funciones RPC expuestas (`GRANT EXECUTE` solo a `service_role`):
 | `create_order_with_reservation` | Crea la orden + reserva stock de forma atómica. Precios siempre leídos server-side. Idempotente (ver DECISIONS.md). |
 | `expire_stale_reservations` | Libera reservas `ACTIVE` vencidas y expira las órdenes correspondientes. Pensada para correr cada 1 min vía `pg_cron`. |
 | `release_reservation_for_order` | Libera de inmediato la reserva de una orden (pago rechazado/cancelado, o cancelación manual). |
-| `confirm_order_paid` | Punto de entrada al recibir un pago aprobado y verificado. Implementa la política de "pago tardío" (ver DECISIONS.md). |
+| `record_payment_and_confirm_order` | Punto de entrada único y agnóstico al proveedor al recibir un hecho de pago ya normalizado y verificado. Registra el pago (idempotente), implementa la política de "pago tardío", detecta doble pago y sincroniza reembolsos/chargebacks (ver DECISIONS.md). |
 | `issue_tickets_after_review` | Resolución manual (fases posteriores) de una orden `PAID_REQUIRES_REVIEW` cuando se liberó capacidad. |
 | `validate_ticket` | Validación atómica de QR en `/scan`. Un `UPDATE ... WHERE status = 'VALID'` garantiza que, ante dos escaneos concurrentes del mismo token, como máximo uno tenga éxito. |
 
@@ -109,7 +143,7 @@ para esto.
 Todos los importes se guardan como enteros en la unidad mínima de la
 moneda (columnas `*_cents`, `integer`/`bigint`), nunca `numeric` ni
 `float`. Se evita cualquier ambigüedad de redondeo entre Postgres,
-TypeScript y la API de Mercado Pago. El precio se lee siempre de
+TypeScript y la API de cualquier proveedor de pagos. El precio se lee siempre de
 `ticket_types.price_cents` en el servidor al crear la orden — nunca se
 confía en un precio enviado por el cliente.
 
@@ -134,8 +168,11 @@ instalado directamente en el entorno, con un mock mínimo de los roles
 Supabase provee de fábrica. Sobre esa base se aplicaron las migraciones
 reales tal cual quedaron en `supabase/migrations/` y se ejecutaron
 pruebas funcionales (creación de orden, idempotencia, sold-out,
-expiración, pago tardío sin stock, doble escaneo concurrente). El
-resultado de esas pruebas está en el informe de cierre de la Fase 1.
+expiración, pago tardío sin stock, doble escaneo concurrente, pago
+rechazado con liberación inmediata, doble pago real de dos proveedores
+distintos para la misma orden, sincronización de reembolso con cascada
+a las entradas). El resultado de esas pruebas está en los informes de
+cierre de la Fase 1 y de su corrección posterior.
 
 `lib/data/database.types.ts` se escribió a mano a partir de las
 migraciones por el mismo motivo (no se pudo generar con el CLI). Debe

@@ -114,7 +114,6 @@ export type Database = {
           total_amount_cents: number;
           idempotency_key: string;
           request_fingerprint: string;
-          mercado_pago_preference_id: string | null;
           requires_review_reason: string | null;
           expires_at: string | null;
           created_at: string;
@@ -131,7 +130,6 @@ export type Database = {
           total_amount_cents: number;
           idempotency_key: string;
           request_fingerprint: string;
-          mercado_pago_preference_id?: string | null;
           requires_review_reason?: string | null;
           expires_at?: string | null;
           created_at?: string;
@@ -184,18 +182,41 @@ export type Database = {
         };
         Update: Partial<Database["public"]["Tables"]["order_items"]["Insert"]>;
       };
-      payments: {
+      payment_attempts: {
         Row: {
           id: string;
           order_id: string;
           provider: string;
+          external_session_id: string | null;
+          status: Database["public"]["Enums"]["payment_attempt_status"];
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: {
+          id?: string;
+          order_id: string;
+          provider: string;
+          external_session_id?: string | null;
+          status?: Database["public"]["Enums"]["payment_attempt_status"];
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: Partial<Database["public"]["Tables"]["payment_attempts"]["Insert"]>;
+      };
+      payments: {
+        Row: {
+          id: string;
+          order_id: string;
+          payment_attempt_id: string | null;
+          provider: string;
           external_payment_id: string;
+          external_reference: string | null;
           status: Database["public"]["Enums"]["payment_status"];
-          status_detail: string | null;
+          raw_provider_status: string | null;
           amount_cents: number;
           currency: string;
-          payment_method: string | null;
-          external_reference: string | null;
+          payment_method_type: Database["public"]["Enums"]["payment_method_type"] | null;
+          reconciliation_status: Database["public"]["Enums"]["payment_reconciliation_status"];
           created_at: string;
           approved_at: string | null;
           updated_at: string;
@@ -203,14 +224,16 @@ export type Database = {
         Insert: {
           id?: string;
           order_id: string;
-          provider?: string;
+          payment_attempt_id?: string | null;
+          provider: string;
           external_payment_id: string;
+          external_reference?: string | null;
           status: Database["public"]["Enums"]["payment_status"];
-          status_detail?: string | null;
+          raw_provider_status?: string | null;
           amount_cents: number;
           currency?: string;
-          payment_method?: string | null;
-          external_reference?: string | null;
+          payment_method_type?: Database["public"]["Enums"]["payment_method_type"] | null;
+          reconciliation_status?: Database["public"]["Enums"]["payment_reconciliation_status"];
           created_at?: string;
           approved_at?: string | null;
           updated_at?: string;
@@ -379,15 +402,22 @@ export type Database = {
         | "EXPIRED"
         | "REFUNDED";
       payment_status:
-        | "pending"
-        | "approved"
-        | "authorized"
-        | "in_process"
-        | "in_mediation"
-        | "rejected"
-        | "cancelled"
-        | "refunded"
-        | "charged_back";
+        | "PENDING"
+        | "IN_PROGRESS"
+        | "APPROVED"
+        | "REJECTED"
+        | "CANCELLED"
+        | "REFUNDED"
+        | "CHARGED_BACK";
+      payment_attempt_status: "CREATED" | "AWAITING_PAYMENT" | "RESOLVED" | "EXPIRED";
+      payment_method_type:
+        | "credit_card"
+        | "debit_card"
+        | "digital_wallet"
+        | "bank_transfer"
+        | "cash"
+        | "other";
+      payment_reconciliation_status: "NORMAL" | "DUPLICATE_REQUIRES_REFUND";
       ticket_status: "VALID" | "USED" | "CANCELLED" | "REFUNDED";
       access_result: "GRANTED" | "DENIED_USED" | "DENIED_INVALID" | "DENIED_CANCELLED";
       webhook_processing_status: "pending" | "processed" | "failed" | "ignored";
@@ -424,11 +454,25 @@ export type Database = {
         Args: { p_order_id: string };
         Returns: undefined;
       };
-      confirm_order_paid: {
-        Args: { p_order_id: string };
+      record_payment_and_confirm_order: {
+        Args: {
+          p_order_id: string;
+          p_payment_attempt_id: string | null;
+          p_provider: string;
+          p_external_payment_id: string;
+          p_status: Database["public"]["Enums"]["payment_status"];
+          p_raw_provider_status: string | null;
+          p_amount_cents: number;
+          p_currency: string;
+          p_payment_method_type: Database["public"]["Enums"]["payment_method_type"] | null;
+          p_external_reference: string | null;
+          p_approved_at: string | null;
+        };
         Returns: {
+          payment_id: string;
           order_status: Database["public"]["Enums"]["order_status"];
           tickets_issued: boolean;
+          reconciliation_status: Database["public"]["Enums"]["payment_reconciliation_status"];
         }[];
       };
       issue_tickets_after_review: {

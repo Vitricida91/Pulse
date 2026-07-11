@@ -3,7 +3,14 @@
 -- Convención monetaria (ver DECISIONS.md): todos los importes se guardan
 -- como enteros en la unidad mínima de la moneda ("centavos"), nunca como
 -- `numeric`/`float`. Evita cualquier ambigüedad de redondeo entre Postgres,
--- TypeScript y la API de Mercado Pago. Columnas terminadas en `_cents`.
+-- TypeScript y la API de cualquier proveedor de pagos. Columnas
+-- terminadas en `_cents`.
+--
+-- Este esquema es agnóstico al proveedor de pagos (ver DECISIONS.md:
+-- "Arquitectura de pagos agnóstica al proveedor"): ninguna tabla del
+-- dominio (`orders`, `tickets`, etc.) tiene columnas específicas de
+-- Mercado Pago ni de ningún otro proveedor. Esa relación vive
+-- exclusivamente en `payment_attempts` y `payments`.
 
 -- ---------------------------------------------------------------------
 -- Enums
@@ -27,18 +34,52 @@ create type public.order_status as enum (
   'REFUNDED'
 );
 
--- Estados oficiales de pago de Mercado Pago (no inventados: coinciden con
--- los valores reales del campo `status` de la API de Pagos).
+-- Estados internos de pago, normalizados y agnósticos al proveedor (ver
+-- DECISIONS.md: "Arquitectura de pagos agnóstica al proveedor"). Cada
+-- adapter concreto (MercadoPagoProvider, futuros BankTransferProvider,
+-- etc.) traduce su propio vocabulario de estados a este conjunto; nunca
+-- se usan acá nombres de estados específicos de un proveedor.
 create type public.payment_status as enum (
-  'pending',
-  'approved',
-  'authorized',
-  'in_process',
-  'in_mediation',
-  'rejected',
-  'cancelled',
-  'refunded',
-  'charged_back'
+  'PENDING',
+  'IN_PROGRESS',
+  'APPROVED',
+  'REJECTED',
+  'CANCELLED',
+  'REFUNDED',
+  'CHARGED_BACK'
+);
+
+-- Estado del intento/sesión de pago iniciado con un proveedor (la
+-- "preferencia" de Mercado Pago es un caso particular de esto, no el
+-- concepto en sí). Independiente de `payment_status`: un intento puede
+-- resolverse en cero, uno o -en teoría- más de un hecho de pago.
+create type public.payment_attempt_status as enum (
+  'CREATED',
+  'AWAITING_PAYMENT',
+  'RESOLVED',
+  'EXPIRED'
+);
+
+-- Categoría genérica del medio de pago, para reportes/analítica
+-- independientes del proveedor. Cada adapter mapea su propio detalle
+-- (ej. el `payment_type_id` de Mercado Pago) a uno de estos valores.
+create type public.payment_method_type as enum (
+  'credit_card',
+  'debit_card',
+  'digital_wallet',
+  'bank_transfer',
+  'cash',
+  'other'
+);
+
+-- Resultado de la conciliación de un hecho de pago contra el estado de
+-- la orden. `DUPLICATE_REQUIRES_REFUND` marca un pago aprobado
+-- genuinamente distinto del que ya había resuelto la orden (ver
+-- DECISIONS.md: política de doble pago). No confundir con un reintento
+-- de webhook del mismo pago, que es idempotente y no genera esta marca.
+create type public.payment_reconciliation_status as enum (
+  'NORMAL',
+  'DUPLICATE_REQUIRES_REFUND'
 );
 
 create type public.ticket_status as enum ('VALID', 'USED', 'CANCELLED', 'REFUNDED');
@@ -124,6 +165,12 @@ create index ticket_types_event_id_idx on public.ticket_types (event_id);
 
 -- ---------------------------------------------------------------------
 -- orders — máquina de estados definida en DECISIONS.md.
+--
+-- Deliberadamente SIN ningún campo de un proveedor de pagos específico
+-- (ver DECISIONS.md: "Arquitectura de pagos agnóstica al proveedor"). La
+-- relación de una orden con sus intentos de pago vive enteramente en
+-- `payment_attempts`/`payments`, referenciando `order_id` — nunca al
+-- revés.
 -- ---------------------------------------------------------------------
 
 create table public.orders (
@@ -136,7 +183,6 @@ create table public.orders (
   total_amount_cents bigint not null check (total_amount_cents >= 0),
   idempotency_key text not null,
   request_fingerprint text not null,
-  mercado_pago_preference_id text,
   requires_review_reason text,
   expires_at timestamptz,
   created_at timestamptz not null default now(),
@@ -145,8 +191,6 @@ create table public.orders (
 );
 
 create unique index orders_idempotency_key_key on public.orders (idempotency_key);
-create unique index orders_mp_preference_id_key on public.orders (mercado_pago_preference_id)
-  where mercado_pago_preference_id is not null;
 create index orders_status_created_at_idx on public.orders (status, created_at);
 create index orders_status_expires_at_idx on public.orders (status, expires_at);
 create index orders_buyer_email_idx on public.orders (buyer_email);
@@ -190,24 +234,64 @@ create table public.order_items (
 create index order_items_order_id_idx on public.order_items (order_id);
 
 -- ---------------------------------------------------------------------
--- payments — un intento de pago real reportado por el proveedor. Una
--- orden puede tener más de un intento (ej. rechazo y reintento).
--- `status_detail`/`payment_method`/`external_reference` son campos
--- reales y acotados de la API de Mercado Pago, seleccionados a propósito
--- (ver AJUSTE 2): nunca se guarda el payload completo del pago acá.
+-- payment_attempts — sesión/intento de pago iniciado con un proveedor
+-- (equivalente genérico a una "preferencia" de Mercado Pago, una
+-- "payment intent" de una tarjeta, o la referencia generada para una
+-- transferencia bancaria). Se crea ANTES de que exista cualquier hecho
+-- de pago confirmado. Una orden puede tener más de un intento (ej. un
+-- primer intento abandonado y un segundo con otro proveedor).
+--
+-- `provider` es `text` a propósito, no un enum: agregar un proveedor
+-- nuevo (adapter en `lib/payments/`) no debe requerir una migración que
+-- extienda un tipo enum de Postgres. La validación del conjunto de
+-- proveedores soportados vive en el código (ver DECISIONS.md).
+-- ---------------------------------------------------------------------
+
+create table public.payment_attempts (
+  id uuid primary key default extensions.gen_random_uuid(),
+  order_id uuid not null references public.orders (id) on delete cascade,
+  provider text not null check (provider <> ''),
+  external_session_id text,
+  status public.payment_attempt_status not null default 'CREATED',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create unique index payment_attempts_provider_session_key
+  on public.payment_attempts (provider, external_session_id)
+  where external_session_id is not null;
+create index payment_attempts_order_id_idx on public.payment_attempts (order_id);
+
+-- ---------------------------------------------------------------------
+-- payments — un hecho de pago real reportado por un proveedor,
+-- normalizado y agnóstico (ver DECISIONS.md: "Arquitectura de pagos
+-- agnóstica al proveedor"). `raw_provider_status`/`payment_method_type`/
+-- `external_reference` son campos genéricos y acotados; cada adapter es
+-- responsable de traducir el vocabulario específico de su proveedor a
+-- estos campos. Nunca se guarda acá el payload completo de un proveedor
+-- (eso, cuando corresponde, es responsabilidad de `webhook_events`).
+--
+-- `external_reference` es el identificador que le pasamos al proveedor
+-- al crear el intento de pago para que nos lo devuelva intacto junto al
+-- hecho de pago (en general, el propio `order_id`); es el mecanismo
+-- preferido y agnóstico para resolver a qué orden pertenece un pago. No
+-- todos los proveedores lo soportan de la misma manera, por eso también
+-- existe `payment_attempt_id` como mecanismo alternativo de enlace.
 -- ---------------------------------------------------------------------
 
 create table public.payments (
   id uuid primary key default extensions.gen_random_uuid(),
   order_id uuid not null references public.orders (id) on delete cascade,
-  provider text not null default 'mercadopago',
+  payment_attempt_id uuid references public.payment_attempts (id),
+  provider text not null check (provider <> ''),
   external_payment_id text not null,
+  external_reference text,
   status public.payment_status not null,
-  status_detail text,
+  raw_provider_status text,
   amount_cents bigint not null check (amount_cents >= 0),
   currency text not null default 'ARS',
-  payment_method text,
-  external_reference text,
+  payment_method_type public.payment_method_type,
+  reconciliation_status public.payment_reconciliation_status not null default 'NORMAL',
   created_at timestamptz not null default now(),
   approved_at timestamptz,
   updated_at timestamptz not null default now()
@@ -216,6 +300,7 @@ create table public.payments (
 create unique index payments_provider_external_id_key
   on public.payments (provider, external_payment_id);
 create index payments_order_id_idx on public.payments (order_id);
+create index payments_payment_attempt_id_idx on public.payments (payment_attempt_id);
 
 -- ---------------------------------------------------------------------
 -- tickets — el QR solo contiene `public_token` (token opaco aleatorio,

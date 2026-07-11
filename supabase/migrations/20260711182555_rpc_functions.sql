@@ -385,52 +385,199 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------
--- confirm_order_paid
+-- record_payment_and_confirm_order
 --
--- Punto de entrada único al recibir un pago aprobado y verificado
--- contra la API de Mercado Pago (ver AJUSTE de "pago aprobado después
--- de expirar una reserva"). Idempotente ante reintentos del webhook.
+-- Punto de entrada único, agnóstico al proveedor, al recibir un hecho de
+-- pago ya verificado contra la API del proveedor correspondiente (nunca
+-- se confía únicamente en el contenido de un webhook — ver SECURITY.md).
+-- La capa de integración (`lib/payments/`, Fase 3) es responsable de
+-- normalizar el estado y los datos del proveedor antes de llamar a esta
+-- función; acá adentro no se conoce ningún detalle específico de
+-- Mercado Pago ni de ningún otro proveedor.
+--
+-- Registra el hecho de pago en `payments` (upsert idempotente por
+-- `(provider, external_payment_id)`, seguro ante reintentos de webhook)
+-- y decide atómicamente, según `p_status` y el estado actual de la
+-- orden:
+--
+--   APPROVED  y la orden todavía no está resuelta (PENDING_PAYMENT,
+--             EXPIRED o CANCELLED) -> intenta emitir tickets (rescata
+--             un pago tardío si hace falta, igual que antes); si no
+--             alcanza la capacidad, PAID_REQUIRES_REVIEW.
+--   APPROVED  pero la orden YA está PAID/PAID_REQUIRES_REVIEW/REFUNDED
+--             con un pago aprobado *distinto* -> doble pago real: se
+--             marca este `payments.reconciliation_status =
+--             DUPLICATE_REQUIRES_REFUND` y se audita, sin tocar la
+--             orden ni emitir tickets de más (ver DECISIONS.md,
+--             "Política de doble pago").
+--   REJECTED / CANCELLED -> libera la reserva de inmediato si la orden
+--             seguía pendiente; si la orden ya está pagada por otro
+--             intento, no cambia nada.
+--   REFUNDED / CHARGED_BACK -> si la orden estaba PAID, la mueve a
+--             REFUNDED y cancela las entradas todavía VALID (nunca las
+--             ya USED).
+--   PENDING / IN_PROGRESS -> solo deja registrado el hecho de pago.
+--
+-- Idempotente ante reintentos del webhook: un mismo
+-- `(provider, external_payment_id)` que vuelve a llegar actualiza la
+-- fila existente y no reprocesa la orden dos veces.
 -- ---------------------------------------------------------------------
 
-create function public.confirm_order_paid(p_order_id uuid)
-returns table (order_status public.order_status, tickets_issued boolean)
+create function public.record_payment_and_confirm_order(
+  p_order_id uuid,
+  p_payment_attempt_id uuid,
+  p_provider text,
+  p_external_payment_id text,
+  p_status public.payment_status,
+  p_raw_provider_status text,
+  p_amount_cents bigint,
+  p_currency text,
+  p_payment_method_type public.payment_method_type,
+  p_external_reference text,
+  p_approved_at timestamptz
+)
+returns table (
+  payment_id uuid,
+  order_status public.order_status,
+  tickets_issued boolean,
+  reconciliation_status public.payment_reconciliation_status
+)
 language plpgsql
 set search_path = public, extensions
 as $$
 declare
   v_order record;
-  v_issued boolean;
+  v_payment_id uuid;
+  v_prior_approved_id uuid;
+  v_issued boolean := false;
+  v_reconciliation public.payment_reconciliation_status := 'NORMAL';
+  v_final_status public.order_status;
 begin
+  if p_provider is null or length(trim(p_provider)) = 0 then
+    raise exception 'INVALID_REQUEST: provider is required';
+  end if;
+
+  select id into v_payment_id
+    from public.payments
+    where provider = p_provider and external_payment_id = p_external_payment_id;
+
+  if found then
+    update public.payments
+      set status = p_status,
+          raw_provider_status = p_raw_provider_status,
+          approved_at = coalesce(p_approved_at, approved_at),
+          updated_at = now()
+      where id = v_payment_id;
+  else
+    insert into public.payments (
+      order_id, payment_attempt_id, provider, external_payment_id, status,
+      raw_provider_status, amount_cents, currency, payment_method_type,
+      external_reference, approved_at
+    ) values (
+      p_order_id, p_payment_attempt_id, p_provider, p_external_payment_id, p_status,
+      p_raw_provider_status, p_amount_cents, p_currency, p_payment_method_type,
+      p_external_reference, p_approved_at
+    )
+    returning id into v_payment_id;
+  end if;
+
+  if p_payment_attempt_id is not null and p_status <> 'PENDING' and p_status <> 'IN_PROGRESS' then
+    update public.payment_attempts
+      set status = 'RESOLVED', updated_at = now()
+      where id = p_payment_attempt_id;
+  end if;
+
   select * into v_order from public.orders where id = p_order_id for update;
 
   if not found then
     raise exception 'ORDER_NOT_FOUND: %', p_order_id;
   end if;
 
-  if v_order.status in ('PAID', 'PAID_REQUIRES_REVIEW', 'REFUNDED') then
-    return query select v_order.status, v_order.status = 'PAID';
-    return;
+  if p_status = 'APPROVED' then
+    if v_order.status in ('PAID', 'PAID_REQUIRES_REVIEW') then
+      -- ¿Es un pago aprobado genuinamente distinto del que ya había
+      -- resuelto la orden, o es un reintento de webhook del mismo pago?
+      select p.id into v_prior_approved_id
+        from public.payments p
+        where p.order_id = p_order_id
+          and p.status = 'APPROVED'
+          and p.id <> v_payment_id
+          and p.reconciliation_status = 'NORMAL'
+        limit 1;
+
+      if v_prior_approved_id is not null then
+        update public.payments set reconciliation_status = 'DUPLICATE_REQUIRES_REFUND' where id = v_payment_id;
+        v_reconciliation := 'DUPLICATE_REQUIRES_REFUND';
+
+        insert into public.admin_audit_logs (action, entity_type, entity_id, metadata)
+          values (
+            'duplicate_payment_detected', 'payments', v_payment_id,
+            jsonb_build_object(
+              'order_id', p_order_id,
+              'prior_payment_id', v_prior_approved_id,
+              'provider', p_provider,
+              'external_payment_id', p_external_payment_id
+            )
+          );
+      end if;
+      v_issued := v_order.status = 'PAID';
+
+    elsif v_order.status = 'REFUNDED' then
+      -- Pago aprobado llegando después de un reembolso ya sincronizado:
+      -- caso anómalo, se registra para revisión, nunca se re-emite nada.
+      update public.payments set reconciliation_status = 'DUPLICATE_REQUIRES_REFUND' where id = v_payment_id;
+      v_reconciliation := 'DUPLICATE_REQUIRES_REFUND';
+
+      insert into public.admin_audit_logs (action, entity_type, entity_id, metadata)
+        values ('payment_after_refund', 'payments', v_payment_id, jsonb_build_object('order_id', p_order_id));
+
+    else
+      -- PENDING_PAYMENT, EXPIRED o CANCELLED: camino normal o rescate de
+      -- pago tardío (igual que antes de esta corrección).
+      v_issued := public._try_issue_tickets_for_order(p_order_id);
+
+      if v_issued then
+        update public.orders
+          set status = 'PAID', paid_at = now(), requires_review_reason = null
+          where id = p_order_id;
+      else
+        update public.orders
+          set status = 'PAID_REQUIRES_REVIEW',
+              requires_review_reason = 'Pago aprobado sin capacidad disponible al momento de la confirmación'
+          where id = p_order_id;
+
+        insert into public.admin_audit_logs (action, entity_type, entity_id, metadata)
+          values ('payment_requires_review', 'orders', p_order_id, jsonb_build_object('reason', 'insufficient_capacity'));
+      end if;
+    end if;
+
+  elsif p_status in ('REJECTED', 'CANCELLED') then
+    if v_order.status in ('PENDING_PAYMENT', 'EXPIRED') then
+      perform public.release_reservation_for_order(p_order_id);
+    end if;
+    -- Si la orden ya está PAID por otro intento, un rechazo de este no
+    -- cambia nada: queda solo registrado en `payments`.
+
+  elsif p_status in ('REFUNDED', 'CHARGED_BACK') then
+    if v_order.status = 'PAID' then
+      update public.orders set status = 'REFUNDED' where id = p_order_id;
+
+      update public.tickets set status = 'REFUNDED'
+        where order_id = p_order_id and status = 'VALID';
+
+      insert into public.admin_audit_logs (action, entity_type, entity_id, metadata)
+        values (
+          'order_refunded_by_provider', 'orders', p_order_id,
+          jsonb_build_object('provider', p_provider, 'external_payment_id', p_external_payment_id)
+        );
+    end if;
   end if;
+  -- PENDING / IN_PROGRESS: sin acción adicional, solo queda registrado
+  -- el hecho de pago (ya hecho arriba).
 
-  v_issued := public._try_issue_tickets_for_order(p_order_id);
+  select status into v_final_status from public.orders where id = p_order_id;
 
-  if v_issued then
-    update public.orders
-      set status = 'PAID', paid_at = now(), requires_review_reason = null
-      where id = p_order_id;
-
-    return query select 'PAID'::public.order_status, true;
-  else
-    update public.orders
-      set status = 'PAID_REQUIRES_REVIEW',
-          requires_review_reason = 'Pago aprobado sin capacidad disponible al momento de la confirmación'
-      where id = p_order_id;
-
-    insert into public.admin_audit_logs (action, entity_type, entity_id, metadata)
-      values ('payment_requires_review', 'orders', p_order_id, jsonb_build_object('reason', 'insufficient_capacity'));
-
-    return query select 'PAID_REQUIRES_REVIEW'::public.order_status, false;
-  end if;
+  return query select v_payment_id, v_final_status, v_issued, v_reconciliation;
 end;
 $$;
 
@@ -580,7 +727,7 @@ revoke execute on function public.create_order_with_reservation(text, text, text
 revoke execute on function public.expire_stale_reservations() from public;
 revoke execute on function public.release_reservation_for_order(uuid) from public;
 revoke execute on function public._try_issue_tickets_for_order(uuid) from public;
-revoke execute on function public.confirm_order_paid(uuid) from public;
+revoke execute on function public.record_payment_and_confirm_order(uuid, uuid, text, text, public.payment_status, text, bigint, text, public.payment_method_type, text, timestamptz) from public;
 revoke execute on function public.issue_tickets_after_review(uuid) from public;
 revoke execute on function public.validate_ticket(text, uuid, text) from public;
 
@@ -588,6 +735,6 @@ grant execute on function public.create_order_with_reservation(text, text, text,
 grant execute on function public.expire_stale_reservations() to service_role;
 grant execute on function public.release_reservation_for_order(uuid) to service_role;
 grant execute on function public._try_issue_tickets_for_order(uuid) to service_role;
-grant execute on function public.confirm_order_paid(uuid) to service_role;
+grant execute on function public.record_payment_and_confirm_order(uuid, uuid, text, text, public.payment_status, text, bigint, text, public.payment_method_type, text, timestamptz) to service_role;
 grant execute on function public.issue_tickets_after_review(uuid) to service_role;
 grant execute on function public.validate_ticket(text, uuid, text) to service_role;

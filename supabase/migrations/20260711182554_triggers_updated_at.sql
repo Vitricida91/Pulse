@@ -26,6 +26,11 @@ create trigger orders_set_updated_at
   for each row
   execute function public.set_updated_at();
 
+create trigger payment_attempts_set_updated_at
+  before update on public.payment_attempts
+  for each row
+  execute function public.set_updated_at();
+
 create trigger payments_set_updated_at
   before update on public.payments
   for each row

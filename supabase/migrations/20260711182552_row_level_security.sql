@@ -38,6 +38,7 @@ begin
       'orders',
       'stock_reservations',
       'order_items',
+      'payment_attempts',
       'payments',
       'tickets',
       'access_logs',

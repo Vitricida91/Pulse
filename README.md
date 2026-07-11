@@ -79,7 +79,7 @@ app/                  Rutas (App Router): públicas, /admin, /scan, /api
 components/           Componentes de UI compartidos
 lib/domain/           Lógica de negocio pura (sin I/O)
 lib/data/             Acceso a datos (Supabase, server-only)
-lib/payments/         Integración con Mercado Pago (Fase 3+)
+lib/payments/         Contrato PaymentProvider agnóstico + adapters (Mercado Pago en Fase 3+)
 lib/tickets/          Generación de QR y tokens (Fase 4+)
 lib/email/            Envío de emails, interfaz EmailProvider (Fase 4+)
 lib/auth/             Sesión y roles (Fase 2+)

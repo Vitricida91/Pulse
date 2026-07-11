@@ -31,9 +31,9 @@ como segunda capa independiente de RLS. El acceso real a datos de
 negocio ocurre siempre server-side con la service role key.
 
 Las funciones RPC críticas (`create_order_with_reservation`,
-`confirm_order_paid`, `validate_ticket`, etc.) tienen `EXECUTE` revocado
-de `PUBLIC` y otorgado únicamente a `service_role` — no son invocables
-por el cliente vía PostgREST.
+`record_payment_and_confirm_order`, `validate_ticket`, etc.) tienen
+`EXECUTE` revocado de `PUBLIC` y otorgado únicamente a `service_role` —
+no son invocables por el cliente vía PostgREST.
 
 Ver el razonamiento completo en `ARCHITECTURE.md` y en `DECISIONS.md`.
 
@@ -67,27 +67,57 @@ enlace"), para no permitir enumerar qué emails tienen compras. Rate
 limiting sobre este endpoint se agrega en la Fase 6, antes de exponerlo
 en producción.
 
-## Datos de Mercado Pago: minimización
+## Pagos: agnóstico al proveedor, datos sanitizados, sin datos de tarjeta
 
-`payments` guarda únicamente campos reales y acotados de la API de
-pagos de Mercado Pago (id externo, estado, detalle de estado, monto,
-moneda, medio de pago, referencia externa) — nunca el payload completo
-del pago como blob. `webhook_events.payload` sí guarda el payload
-completo de la notificación recibida (necesario para auditoría e
-idempotencia de webhooks), pero es un registro interno de
-infraestructura, no expuesto a ningún rol de cliente (mismo RLS
-deny-by-default) y candidato a política de retención/purga cuando se
-implementen los webhooks reales en la Fase 3.
+La aplicación nunca recibe ni almacena número completo de tarjeta, CVV,
+ni ninguna credencial de billetera virtual — esos datos los procesa
+exclusivamente el proveedor de pagos (Mercado Pago u otro). El dominio
+de la ticketera solo conoce: qué orden se pagó, por qué monto, en qué
+moneda, el estado normalizado, el proveedor, el tipo general de medio
+de pago (`payment_method_type`: tarjeta de crédito/débito, billetera
+virtual, transferencia, efectivo, otro) y el identificador externo
+necesario para conciliación. Ver el contrato `PaymentProvider` en
+`lib/payments/types.ts` y "Arquitectura de pagos agnóstica al
+proveedor" en `ARCHITECTURE.md`.
+
+`payments` guarda únicamente campos genéricos y acotados
+(`external_payment_id`, `status`, `raw_provider_status`, monto, moneda,
+`payment_method_type`, `external_reference`) — nunca el payload
+completo de un pago como blob, y nunca un campo con el nombre de una
+API de un proveedor específico. `webhook_events.payload` sí guarda el
+payload completo de la notificación recibida (necesario para auditoría
+e idempotencia de webhooks de cualquier proveedor), pero es un registro
+interno de infraestructura, no expuesto a ningún rol de cliente (mismo
+RLS deny-by-default) y candidato a política de retención/purga cuando
+se implementen los webhooks reales en la Fase 3.
+
+## Doble pago de una misma orden
+
+Si dos hechos de pago **distintos** (mismo proveedor dos veces, o dos
+proveedores diferentes) resultan aprobados para la misma orden,
+`record_payment_and_confirm_order` detecta que la orden ya fue resuelta
+por un pago anterior, marca el segundo pago
+`reconciliation_status = 'DUPLICATE_REQUIRES_REFUND'` y lo audita en
+`admin_audit_logs` — nunca emite entradas de más ni cambia el estado de
+la orden. La resolución (reembolsar el pago duplicado) es manual desde
+el panel admin. Ver el detalle de la política y por qué en
+`DECISIONS.md`.
 
 ## Verificación de webhooks (Fase 3)
 
-Los webhooks de Mercado Pago se verifican con la firma del header
-`x-signature` (`ts` + `v1`, HMAC-SHA256 con `MERCADOPAGO_WEBHOOK_SECRET`)
-antes de procesar cualquier notificación. El estado del pago **siempre**
-se re-confirma contra la API de Mercado Pago (`GET /v1/payments/{id}`)
-— nunca se confía únicamente en el contenido del webhook ni en que el
-navegador haya vuelto a una URL de éxito. Idempotencia garantizada por
-el constraint único `(provider, external_event_id)` en `webhook_events`.
+Cada proveedor tiene su propia ruta de webhook
+(`/api/webhooks/[provider]`), su propia verificación de firma/autenticación
+y su propio parser — la normalización a `NormalizedPaymentFact` y todo
+lo posterior (`record_payment_and_confirm_order`) es común. Para
+Mercado Pago específicamente: firma del header `x-signature` (`ts` +
+`v1`, HMAC-SHA256 con `MERCADOPAGO_WEBHOOK_SECRET`) antes de procesar
+cualquier notificación. El estado del pago **siempre** se re-confirma
+contra la API del proveedor (`GET /v1/payments/{id}` en el caso de
+Mercado Pago) — nunca se confía únicamente en el contenido del webhook
+ni en que el navegador haya vuelto a una URL de éxito. Idempotencia
+garantizada por el constraint único `(provider, external_event_id)` en
+`webhook_events` (a nivel de notificación) y `(provider,
+external_payment_id)` en `payments` (a nivel de hecho de pago).
 
 ## Minimización de datos personales
 
